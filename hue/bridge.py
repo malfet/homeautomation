@@ -3,6 +3,7 @@
 
 import json
 import ssl
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -90,7 +91,24 @@ def get_api(bridge_ip: str, endpoint: str, app_key: str) -> dict:
         return json.loads(resp.read())
 
 
+def put_api(bridge_ip: str, endpoint: str, app_key: str, body: dict) -> dict:
+    """Make a PUT request to the Hue CLIP v2 API."""
+    url = f"https://{bridge_ip}/clip/v2/resource/{endpoint}"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        url, data=data, method="PUT",
+        headers={"hue-application-key": app_key, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, context=_no_verify_ctx()) as resp:
+        return json.loads(resp.read())
+
+
 def main() -> None:
+    verb = sys.argv[1] if len(sys.argv) > 1 else "list"
+    if verb not in ("list", "on", "off"):
+        print(f"Usage: {sys.argv[0]} [list|on|off]", file=sys.stderr)
+        sys.exit(1)
+
     # Step 1: Discover bridges
     print("Discovering Hue bridges...")
     bridges = discover_bridges()
@@ -122,14 +140,26 @@ def main() -> None:
         save_credentials(ip, creds)
         print(f"Registered! App key: {creds['username'][:8]}...")
 
-    # Step 4: List devices with state
+    # Step 4: Fetch lights
+    lights_data = get_api(ip, "light", creds["username"])
+    lights = lights_data.get("data", [])
+
+    if verb in ("on", "off"):
+        turn_on = verb == "on"
+        for light in lights:
+            light_id = light["id"]
+            name = light.get("metadata", {}).get("name", light_id)
+            put_api(ip, f"light/{light_id}", creds["username"], {"on": {"on": turn_on}})
+            print(f"  {name}: turned {verb}")
+        return
+
+    # List devices with state
     print("\nDevices:")
     data = get_api(ip, "device", creds["username"])
-    lights_data = get_api(ip, "light", creds["username"])
 
     # Map device id -> list of light resources owned by that device
     lights_by_device: dict[str, list[dict]] = {}
-    for light in lights_data.get("data", []):
+    for light in lights:
         owner_id = light.get("owner", {}).get("rid")
         if owner_id:
             lights_by_device.setdefault(owner_id, []).append(light)
