@@ -122,13 +122,40 @@ def main() -> None:
         save_credentials(ip, creds)
         print(f"Registered! App key: {creds['username'][:8]}...")
 
-    # Step 4: List devices
+    # Step 4: List devices with state
     print("\nDevices:")
     data = get_api(ip, "device", creds["username"])
+    lights_data = get_api(ip, "light", creds["username"])
+
+    # Map device id -> list of light resources owned by that device
+    lights_by_device: dict[str, list[dict]] = {}
+    for light in lights_data.get("data", []):
+        owner_id = light.get("owner", {}).get("rid")
+        if owner_id:
+            lights_by_device.setdefault(owner_id, []).append(light)
+
     for device in data.get("data", []):
         name = device.get("metadata", {}).get("name", "(unnamed)")
         product = device.get("product_data", {}).get("product_name", "")
-        print(f"  - {name} ({product})")
+        device_id = device.get("id", "")
+
+        state_parts = []
+        for light in lights_by_device.get(device_id, []):
+            on = light.get("on", {}).get("on")
+            if on is None:
+                continue
+            if not on:
+                state_parts.append("off")
+            else:
+                brightness = light.get("dimming", {}).get("brightness")
+                s = "on"
+                if brightness is not None:
+                    s += f" {brightness:.0f}%"
+                state_parts.append(s)
+
+        state_str = ", ".join(state_parts) if state_parts else None
+        suffix = f": {state_str}" if state_str else ""
+        print(f"  - {name} ({product}){suffix}")
 
 
 if __name__ == "__main__":
