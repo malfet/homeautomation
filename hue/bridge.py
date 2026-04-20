@@ -6,6 +6,7 @@ import ssl
 import sys
 import time
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DISCOVERY_URL = "https://discovery.meethue.com"
@@ -103,13 +104,126 @@ def put_api(bridge_ip: str, endpoint: str, app_key: str, body: dict) -> dict:
         return json.loads(resp.read())
 
 
+@dataclass
+class Light:
+    id: str
+    name: str
+    on: bool | None
+    brightness: float | None
+
+    def state_str(self) -> str:
+        if self.on is None:
+            return ""
+        if not self.on:
+            return "off"
+        return "on" + (f" {self.brightness:.0f}%" if self.brightness is not None else "")
+
+
+@dataclass
+class LightGroup:
+    id: str
+    name: str
+    on: bool | None
+    brightness: float | None
+    lights: list[Light] = field(default_factory=list)
+
+    def state_str(self) -> str:
+        if self.on is None:
+            return ""
+        if not self.on:
+            return "off"
+        return "on" + (f" {self.brightness:.0f}%" if self.brightness is not None else "")
+
+
+def fetch_light_info(bridge_ip: str, app_key: str) -> tuple[list[LightGroup], list[Light]]:
+    """Return (groups, ungrouped_lights) fetched from the bridge."""
+    raw_lights = get_api(bridge_ip, "light", app_key).get("data", [])
+    grouped_lights_raw = get_api(bridge_ip, "grouped_light", app_key).get("data", [])
+    rooms_raw = get_api(bridge_ip, "room", app_key).get("data", [])
+    zones_raw = get_api(bridge_ip, "zone", app_key).get("data", [])
+
+    lights = [
+        Light(
+            id=r["id"],
+            name=r.get("metadata", {}).get("name", "(unnamed)"),
+            on=r.get("on", {}).get("on"),
+            brightness=r.get("dimming", {}).get("brightness"),
+        )
+        for r in raw_lights
+    ]
+    light_by_id = {l.id: l for l in lights}
+
+    lights_by_device: dict[str, list[Light]] = {}
+    for raw, light in zip(raw_lights, lights):
+        device_id = raw.get("owner", {}).get("rid")
+        if device_id:
+            lights_by_device.setdefault(device_id, []).append(light)
+
+    grouped_light_by_id = {gl["id"]: gl for gl in grouped_lights_raw}
+
+    # Build grouped_light_id -> (name, member_lights) from rooms then zones
+    groups_map: dict[str, tuple[str, list[Light]]] = {}
+
+    for room in rooms_raw:
+        gl_id = next((svc["rid"] for svc in room.get("services", [])
+                      if svc.get("rtype") == "grouped_light"), None)
+        if gl_id is None:
+            continue
+        name = room.get("metadata", {}).get("name", "(unnamed)")
+        member_lights = [
+            light
+            for child in room.get("children", [])
+            if child.get("rtype") == "device"
+            for light in lights_by_device.get(child["rid"], [])
+        ]
+        groups_map[gl_id] = (name, member_lights)
+
+    for zone in zones_raw:
+        gl_id = next((svc["rid"] for svc in zone.get("services", [])
+                      if svc.get("rtype") == "grouped_light"), None)
+        if gl_id is None:
+            continue
+        name = zone.get("metadata", {}).get("name", "(unnamed)")
+        member_lights = [
+            light_by_id[child["rid"]]
+            for child in zone.get("children", [])
+            if child.get("rtype") == "light" and child["rid"] in light_by_id
+        ] + [
+            light
+            for child in zone.get("children", [])
+            if child.get("rtype") == "device"
+            for light in lights_by_device.get(child["rid"], [])
+        ]
+        groups_map[gl_id] = (name, member_lights)
+
+    groups: list[LightGroup] = []
+    seen_light_ids: set[str] = set()
+    for gl_id, (name, member_lights) in groups_map.items():
+        if not member_lights:
+            continue
+        raw_gl = grouped_light_by_id.get(gl_id, {})
+        groups.append(LightGroup(
+            id=gl_id,
+            name=name,
+            on=raw_gl.get("on", {}).get("on"),
+            brightness=raw_gl.get("dimming", {}).get("brightness"),
+            lights=member_lights,
+        ))
+        for light in member_lights:
+            seen_light_ids.add(light.id)
+
+    ungrouped = [l for l in lights if l.id not in seen_light_ids]
+    return groups, ungrouped
+
+
 def main() -> None:
     verb = sys.argv[1] if len(sys.argv) > 1 else "list"
-    if verb not in ("list", "on", "off"):
-        print(f"Usage: {sys.argv[0]} [list|on|off]", file=sys.stderr)
+    target_name = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if verb not in ("list", "list_groups", "on", "off"):
+        print(f"Usage: {sys.argv[0]} [list|list_groups|on|off] [name]", file=sys.stderr)
         sys.exit(1)
 
-    # Step 1: Discover bridges
     print("Discovering Hue bridges...")
     bridges = discover_bridges()
     if not bridges:
@@ -119,20 +233,13 @@ def main() -> None:
     for i, b in enumerate(bridges):
         print(f"  [{i}] {b['id']} @ {b['internalipaddress']}")
 
-    if len(bridges) == 1:
-        bridge = bridges[0]
-    else:
-        idx = int(input("Select bridge: "))
-        bridge = bridges[idx]
-
+    bridge = bridges[0] if len(bridges) == 1 else bridges[int(input("Select bridge: "))]
     ip = bridge["internalipaddress"]
 
-    # Step 2: Check for existing credentials
     creds = load_credentials(ip)
     if creds:
         print(f"Found existing credentials for {ip}")
     else:
-        # Step 3: Register
         print(f"\nPress the link button on your bridge ({ip}), then press Enter...")
         input()
         print("Registering application...")
@@ -140,52 +247,52 @@ def main() -> None:
         save_credentials(ip, creds)
         print(f"Registered! App key: {creds['username'][:8]}...")
 
-    # Step 4: Fetch lights
-    lights_data = get_api(ip, "light", creds["username"])
-    lights = lights_data.get("data", [])
+    groups, ungrouped = fetch_light_info(ip, creds["username"])
 
     if verb in ("on", "off"):
         turn_on = verb == "on"
-        for light in lights:
-            light_id = light["id"]
-            name = light.get("metadata", {}).get("name", light_id)
-            put_api(ip, f"light/{light_id}", creds["username"], {"on": {"on": turn_on}})
-            print(f"  {name}: turned {verb}")
+        if target_name:
+            matched_group = next((g for g in groups if g.name.lower() == target_name.lower()), None)
+            if matched_group:
+                put_api(ip, f"grouped_light/{matched_group.id}", creds["username"], {"on": {"on": turn_on}})
+                print(f"  {matched_group.name}: turned {verb}")
+                return
+            all_lights = [l for g in groups for l in g.lights] + ungrouped
+            matched_light = next((l for l in all_lights if l.name.lower() == target_name.lower()), None)
+            if matched_light:
+                put_api(ip, f"light/{matched_light.id}", creds["username"], {"on": {"on": turn_on}})
+                print(f"  {matched_light.name}: turned {verb}")
+                return
+            print(f"No light or group named '{target_name}' found.", file=sys.stderr)
+            sys.exit(1)
+        for group in groups:
+            put_api(ip, f"grouped_light/{group.id}", creds["username"], {"on": {"on": turn_on}})
+            print(f"  {group.name}: turned {verb}")
+        for light in ungrouped:
+            put_api(ip, f"light/{light.id}", creds["username"], {"on": {"on": turn_on}})
+            print(f"  {light.name}: turned {verb}")
         return
 
-    # List devices with state
-    print("\nDevices:")
-    data = get_api(ip, "device", creds["username"])
+    if verb == "list_groups":
+        print("\nGroups:")
+        for group in groups:
+            state = group.state_str()
+            print(f"  {group.name}" + (f": {state}" if state else ""))
+        return
 
-    # Map device id -> list of light resources owned by that device
-    lights_by_device: dict[str, list[dict]] = {}
-    for light in lights:
-        owner_id = light.get("owner", {}).get("rid")
-        if owner_id:
-            lights_by_device.setdefault(owner_id, []).append(light)
-
-    for device in data.get("data", []):
-        name = device.get("metadata", {}).get("name", "(unnamed)")
-        product = device.get("product_data", {}).get("product_name", "")
-        device_id = device.get("id", "")
-
-        state_parts = []
-        for light in lights_by_device.get(device_id, []):
-            on = light.get("on", {}).get("on")
-            if on is None:
-                continue
-            if not on:
-                state_parts.append("off")
-            else:
-                brightness = light.get("dimming", {}).get("brightness")
-                s = "on"
-                if brightness is not None:
-                    s += f" {brightness:.0f}%"
-                state_parts.append(s)
-
-        state_str = ", ".join(state_parts) if state_parts else None
-        suffix = f": {state_str}" if state_str else ""
-        print(f"  - {name} ({product}){suffix}")
+    print("\nLights:")
+    for group in groups:
+        state = group.state_str()
+        print(f"  {group.name}" + (f": {state}" if state else ""))
+        for light in group.lights:
+            state = light.state_str()
+            print(f"    - {light.name}" + (f": {state}" if state else ""))
+    if ungrouped:
+        if groups:
+            print("  (ungrouped)")
+        for light in ungrouped:
+            state = light.state_str()
+            print(f"  - {light.name}" + (f": {state}" if state else ""))
 
 
 if __name__ == "__main__":
