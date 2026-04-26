@@ -216,13 +216,35 @@ def fetch_light_info(bridge_ip: str, app_key: str) -> tuple[list[LightGroup], li
     return groups, ungrouped
 
 
+def _parse_brightness(s: str) -> float | None:
+    """Parse 's' as a brightness percentage (0–100), or return None if not numeric."""
+    try:
+        return float(s.rstrip("%"))
+    except ValueError:
+        return None
+
+
 def main() -> None:
     verb = sys.argv[1] if len(sys.argv) > 1 else "list"
-    target_name = sys.argv[2] if len(sys.argv) > 2 else None
 
     if verb not in ("list", "list_groups", "on", "off"):
-        print(f"Usage: {sys.argv[0]} [list|list_groups|on|off] [name]", file=sys.stderr)
+        print(f"Usage: {sys.argv[0]} [list|list_groups|on|off] [name] [brightness]", file=sys.stderr)
         sys.exit(1)
+
+    # Parse optional name and brightness from remaining argv.
+    # Brightness can be a bare number or end with '%', e.g. "75" or "75%".
+    # It may appear without a name: `on 75` or after a name: `on "Room" 75`.
+    target_name: str | None = None
+    brightness: float | None = None
+    args = sys.argv[2:]
+    if args:
+        b = _parse_brightness(args[0])
+        if b is not None:
+            brightness = b          # numeric first arg → brightness only
+        else:
+            target_name = args[0]   # string first arg → name
+            if len(args) > 1:
+                brightness = _parse_brightness(args[1])
 
     print("Discovering Hue bridges...")
     bridges = discover_bridges()
@@ -251,25 +273,29 @@ def main() -> None:
 
     if verb in ("on", "off"):
         turn_on = verb == "on"
+        body: dict = {"on": {"on": turn_on}}
+        if turn_on and brightness is not None:
+            body["dimming"] = {"brightness": brightness}
+
         if target_name:
             matched_group = next((g for g in groups if g.name.lower() == target_name.lower()), None)
             if matched_group:
-                put_api(ip, f"grouped_light/{matched_group.id}", creds["username"], {"on": {"on": turn_on}})
+                put_api(ip, f"grouped_light/{matched_group.id}", creds["username"], body)
                 print(f"  {matched_group.name}: turned {verb}")
                 return
             all_lights = [l for g in groups for l in g.lights] + ungrouped
             matched_light = next((l for l in all_lights if l.name.lower() == target_name.lower()), None)
             if matched_light:
-                put_api(ip, f"light/{matched_light.id}", creds["username"], {"on": {"on": turn_on}})
+                put_api(ip, f"light/{matched_light.id}", creds["username"], body)
                 print(f"  {matched_light.name}: turned {verb}")
                 return
             print(f"No light or group named '{target_name}' found.", file=sys.stderr)
             sys.exit(1)
         for group in groups:
-            put_api(ip, f"grouped_light/{group.id}", creds["username"], {"on": {"on": turn_on}})
+            put_api(ip, f"grouped_light/{group.id}", creds["username"], body)
             print(f"  {group.name}: turned {verb}")
         for light in ungrouped:
-            put_api(ip, f"light/{light.id}", creds["username"], {"on": {"on": turn_on}})
+            put_api(ip, f"light/{light.id}", creds["username"], body)
             print(f"  {light.name}: turned {verb}")
         return
 
